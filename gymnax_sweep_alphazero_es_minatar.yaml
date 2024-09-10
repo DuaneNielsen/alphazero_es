@@ -1,0 +1,72 @@
+# sweep.yaml
+program: alphazero_es_gymnax_minatar.py
+method: bayes
+metric:
+  name: best_eval
+  goal: maximize
+parameters:
+  env_name:
+    value: Breakout-MinAtar
+  num_output_units:
+    value: 3
+  output_activation:
+    value: 'categorical'
+  seed:
+    values: [ 0 ]
+  popsize:
+    values: [ 600 ]
+  aznet_channels:
+    values: [ 8 ]
+  aznet_blocks:
+    values: [ 5 ]
+  aznet_layernorm:
+    values: [ 'None' ]
+  num_generations:
+    values: [ 64 ]
+  num_mc_evals:
+    values: [ 3 ]
+  max_epi_len:
+    values: [340]
+  # Modify these parameters for Bayesian search
+  sigma_init:
+    #     values: [0.04]
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.1
+  sigma_decay:
+    value: 1.0
+    # distribution: log_uniform_values
+    # min: 0.99
+    #  max: 0.9999
+  sigma_limit:
+    value: 0.0001
+  #    distribution: log_uniform_values
+  #    min: 0.0001
+  #    max: 0.01
+  opt_name:
+    value: "adam"
+  lrate_init:
+    #     values: [ 0.01, 0.001]
+    distribution: log_uniform_values
+    min: 0.001
+    max: 0.1
+  lrate_decay:
+    value: 1.0
+  #    distribution: log_uniform_values
+  #    min: 0.99
+  #    max: 0.9999
+  lrate_limit:
+    value: 0.0001
+  #    distribution: log_uniform_values
+  #    min: 0.00001
+  #    max: 0.001
+  num_simulations:
+    values: [ 64 ]
+#  boosted_eval_num_simulations:
+#    value: 1000
+
+command:
+  - ${env}
+  - python
+  - ${program}
+  - ${args}
