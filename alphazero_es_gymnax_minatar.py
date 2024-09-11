@@ -33,21 +33,21 @@ parser.add_argument('--aznet_layernorm', type=str, default='None')
 parser.add_argument('--num_output_units', type=int, default=3)
 parser.add_argument('--output_activation', type=str, default='categorical')
 parser.add_argument('--env_name', type=str, default='Breakout-MinAtar')
-parser.add_argument('--popsize', type=int, default=1600)
-parser.add_argument('--sigma_init', type=float, default=0.03)
+parser.add_argument('--popsize', type=int, default=600)
+parser.add_argument('--sigma_init', type=float, default=0.01)
 parser.add_argument('--sigma_decay', type=float, default=1.0)
 parser.add_argument('--sigma_limit', type=float, default=0.01)
-parser.add_argument('--lrate_init', type=float, default=0.05)
+parser.add_argument('--lrate_init', type=float, default=0.0114)
 parser.add_argument('--lrate_decay', type=float, default=1.0)
 parser.add_argument('--lrate_limit', type=float, default=0.001)
-parser.add_argument('--num_generations', type=int, default=320)
-parser.add_argument('--num_mc_evals', type=int, default=1)
+parser.add_argument('--num_generations', type=int, default=128)
+parser.add_argument('--num_mc_evals', type=int, default=3)
 parser.add_argument('--network', type=str, default='AZnet')  # so it appears as a hyperparameter in wandb
 parser.add_argument('--seed', type=int, default=0)
-parser.add_argument('--num_simulations', type=int, default=16)
+parser.add_argument('--num_simulations', type=int, default=64)
 parser.add_argument('--visualize_off', action='store_true')
-parser.add_argument('--max_epi_len', type=int, default=1000)
-parser.add_argument('--opt_name', type=str, choices=evosax.core.GradientOptimizer.keys(), default='sgd')
+parser.add_argument('--max_epi_len', type=int, default=340)
+parser.add_argument('--opt_name', type=str, choices=evosax.core.GradientOptimizer.keys(), default='adam')
 parser.add_argument('--boosted_eval_num_simulations', type=int, default=None, help='evaluate best scores a second time with this many simulations')
 args = parser.parse_args()
 
@@ -247,7 +247,7 @@ class RolloutWrapper(object):
             state_input = jax.tree.map(lambda s: jnp.expand_dims(s, axis=0), state_input)
 
             # compute the logits and values for the next state
-            logits, value = self.model_forward(model_params, obs, rng_net)
+            logits, value = self.model_forward(model_params, next_obs, rng_net)
 
             # mask invalid actions
             logits = logits - jnp.max(logits, axis=-1, keepdims=True)
