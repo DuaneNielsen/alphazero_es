@@ -39,7 +39,7 @@ parser.add_argument('--sigma_limit', type=float, default=0.01)
 parser.add_argument('--lrate_init', type=float, default=0.0114)
 parser.add_argument('--lrate_decay', type=float, default=1.0)
 parser.add_argument('--lrate_limit', type=float, default=0.001)
-parser.add_argument('--num_generations', type=int, default=128)
+parser.add_argument('--num_generations', type=int, default=256)
 parser.add_argument('--num_mc_evals', type=int, default=3)
 parser.add_argument('--network', type=str, default='AZnet')  # so it appears as a hyperparameter in wandb
 parser.add_argument('--seed', type=int, default=0)
@@ -388,7 +388,7 @@ manager.single_rollout(jax.random.PRNGKey(0), 4, init_policy_params)
 
 import wandb
 
-wandb.init(project=f'alphazero-es-{args.env_name}', config=args.__dict__, settings=wandb.Settings(code_dir="."))
+wandb.init(project=f'alphazero-es-pgx-{args.env_name}', config=args.__dict__, settings=wandb.Settings(code_dir="."))
 
 # num_generations = 100
 # num_mc_evals = 128
