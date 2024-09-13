@@ -9,6 +9,7 @@ from typing import Tuple, Optional, Union
 import jax
 import jax.numpy as jnp
 from evosax import ParameterReshaper, FitnessShaper, OpenES
+import numpy as np
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 import pickle
@@ -283,7 +284,7 @@ class RolloutWrapper(object):
                 root=root,
                 recurrent_fn=recurrent_fn,
                 num_simulations=num_simulations,
-                invalid_actions=jnp.zeros_like(logits),
+                invalid_actions=~state_input.state.legal_action_mask,
                 qtransform=mctx.qtransform_completed_by_mix_value,
                 gumbel_scale=1.0,
             )
@@ -291,9 +292,6 @@ class RolloutWrapper(object):
             # action = jax.random.categorical(rng_action, jnp.log(policy_output.action_weights), axis=-1)
             state_input, action = jax.tree.map(lambda x: x.squeeze(0), state_input), policy_output.action.squeeze(0)
             next_state = self.env.step(state_input.state, action, rng_env)
-
-
-
             reward = next_state.rewards[state_input.state.current_player]
             done = state_input.state.terminated | state_input.state.truncated
             new_cum_reward = state_input.cum_reward + reward * ~done
@@ -312,8 +310,8 @@ class RolloutWrapper(object):
         def early_termination_loop_with_trajectory(policy_step, max_steps, initial_state):
             def cond_fn(carry):
                 state, _ = carry
-                done = state.state.truncated | state.state.terminated
-                return jnp.logical_and(jnp.logical_not(jnp.all(done)), jnp.any(state.steps < max_steps))
+                done = state.state.truncated | state.state.terminated | (state.steps.squeeze() == max_steps)
+                return jnp.logical_not(jnp.all(done))
 
             def body_fn(carry):
                 state, trajectory = carry
@@ -362,6 +360,7 @@ class RolloutWrapper(object):
         return state.observation.shape
 
 
+print('starting')
 # Define rollout manager for env
 manager = RolloutWrapper(model.apply, env_name=args.env_name, num_env_steps=args.max_epi_len)
 
@@ -384,10 +383,12 @@ es_state = strategy.initialize(rng, es_params)
 
 fit_shaper = FitnessShaper(maximize=True, centered_rank=True)
 
-manager.single_rollout(jax.random.PRNGKey(0), 4, init_policy_params)
+
+state, action, next_state, cum_ret, steps =  manager.single_rollout(jax.random.PRNGKey(0), 4, init_policy_params)
+# print(next_state.terminated)
+# print(next_state.reward)
 
 import wandb
-
 wandb.init(project=f'alphazero-es-pgx-{args.env_name}', config=args.__dict__, settings=wandb.Settings(code_dir="."))
 
 # num_generations = 100
@@ -395,6 +396,7 @@ wandb.init(project=f'alphazero-es-pgx-{args.env_name}', config=args.__dict__, se
 print_every_k_gens = 1
 best_eval = -jnp.inf
 total_frames = 0
+
 
 for gen in range(args.num_generations):
     rng, rng_init, rng_ask, rng_rollout, rng_eval = jax.random.split(rng, 5)
@@ -406,8 +408,7 @@ for gen in range(args.num_generations):
     rng_batch_rollout = jax.random.split(rng_rollout, args.num_mc_evals)
 
     # Perform population evaluation
-    _, _, _, cum_ret, steps = manager.population_rollout(rng_batch_rollout, args.num_simulations,
-                                                                  reshaped_params)
+    _, _, _, cum_ret, steps = manager.population_rollout(rng_batch_rollout, args.num_simulations, reshaped_params)
 
     # Mean over MC rollouts, shape fitness and update strategy
     fitness = cum_ret.mean(axis=1).squeeze()
