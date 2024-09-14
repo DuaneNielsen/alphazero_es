@@ -40,7 +40,7 @@ parser.add_argument('--sigma_limit', type=float, default=0.001)
 parser.add_argument('--lrate_init', type=float, default=0.0114)
 parser.add_argument('--lrate_decay', type=float, default=1.0)
 parser.add_argument('--lrate_limit', type=float, default=0.001)
-parser.add_argument('--num_generations', type=int, default=128)
+parser.add_argument('--num_generations', type=int, default=512)
 parser.add_argument('--num_mc_evals', type=int, default=3)
 parser.add_argument('--network', type=str, default='AZnet')  # so it appears as a hyperparameter in wandb
 parser.add_argument('--seed', type=int, default=0)
