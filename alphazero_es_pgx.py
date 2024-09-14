@@ -34,13 +34,13 @@ parser.add_argument('--num_output_units', type=int, default=3)
 parser.add_argument('--output_activation', type=str, default='categorical')
 parser.add_argument('--env_name', type=str, default='minatar-breakout')
 parser.add_argument('--popsize', type=int, default=600)
-parser.add_argument('--sigma_init', type=float, default=0.01)
+parser.add_argument('--sigma_init', type=float, default=0.001)
 parser.add_argument('--sigma_decay', type=float, default=1.0)
-parser.add_argument('--sigma_limit', type=float, default=0.01)
+parser.add_argument('--sigma_limit', type=float, default=0.001)
 parser.add_argument('--lrate_init', type=float, default=0.0114)
 parser.add_argument('--lrate_decay', type=float, default=1.0)
 parser.add_argument('--lrate_limit', type=float, default=0.001)
-parser.add_argument('--num_generations', type=int, default=256)
+parser.add_argument('--num_generations', type=int, default=128)
 parser.add_argument('--num_mc_evals', type=int, default=3)
 parser.add_argument('--network', type=str, default='AZnet')  # so it appears as a hyperparameter in wandb
 parser.add_argument('--seed', type=int, default=0)
@@ -48,7 +48,8 @@ parser.add_argument('--num_simulations', type=int, default=64)
 parser.add_argument('--visualize_off', action='store_true')
 parser.add_argument('--max_epi_len', type=int, default=340)
 parser.add_argument('--opt_name', type=str, choices=evosax.core.GradientOptimizer.keys(), default='adam')
-parser.add_argument('--boosted_eval_num_simulations', type=int, default=None, help='evaluate best scores a second time with this many simulations')
+parser.add_argument('--boosted_eval_num_simulations', type=int, default=None,
+                    help='evaluate best scores a second time with this many simulations')
 args = parser.parse_args()
 
 rng = jax.random.PRNGKey(args.seed)
@@ -155,6 +156,7 @@ class AZNet(nn.Module):
         # x_out = jax.random.categorical(rng, x)
         # return x_out
 
+
 import pgx
 
 # Create placeholder params for env
@@ -179,12 +181,22 @@ import jax.numpy as jnp
 import pgx
 import chex
 
+
+@chex.dataclass
+class SearchStats:
+    num_simulations: chex.Array
+    value_mean: chex.Array
+    rewards_sum: chex.Array
+    terminated_sum: chex.Array
+
+
 @chex.dataclass
 class Carry:
-    rng : chex.Array
+    rng: chex.Array
     state: pgx.State
-    policy_params : chex.Array
-    cum_reward : chex.Array
+    policy_params: chex.Array
+    cum_reward: chex.Array
+    valid_mask: chex.Array
     steps: chex.Array
 
 
@@ -199,7 +211,9 @@ class RolloutWrapper(object):
     ):
         """Wrapper to define batch evaluation for generation parameters."""
         self.env_name = env_name
-        self.env = pgx.make(env_name)
+        # self.env = pgx.make(env_name)
+        from pgx.minatar.breakout import MinAtarBreakout
+        self.env = MinAtarBreakout(sticky_action_prob=0.0)
         self.model_forward = model_forward
         self.num_env_steps = num_env_steps
 
@@ -224,20 +238,21 @@ class RolloutWrapper(object):
         rng_reset, rng_episode = jax.random.split(rng_input)
         state = self.env.init(rng_reset)
 
+        def update_rewards(state_input, next_state):
+            reward = next_state.rewards[state_input.state.current_player]
+            done = state_input.state.terminated | state_input.state.truncated
+            new_cum_reward = state_input.cum_reward + reward * state_input.valid_mask
+            new_valid_mask = state_input.valid_mask * (1 - done)
+            return reward, new_cum_reward, new_valid_mask
+
         def recurrent_fn(model_params, rng_key: jnp.ndarray, action: jnp.ndarray, state_input):
             rng_key, rng_step, rng_net, rng_env = jax.random.split(rng_key, 4)
 
             state_input, action = jax.tree.map(lambda x: x.squeeze(0), state_input), action.squeeze(0)
-
-            # step the environment
             next_state = self.env.step(state_input.state, action, rng_env)
 
-            # store the transition and reward
-            reward = next_state.rewards[state_input.state.current_player]
-            done = state_input.state.terminated | state_input.state.truncated
-            new_cum_reward = state_input.cum_reward + reward * ~done
+            reward, new_cum_reward, new_valid_mask = update_rewards(state_input, next_state)
 
-            # compute the logits and values for the next state
             logits, value = self.model_forward(model_params, next_state.observation, rng_net)
 
             # mask invalid actions
@@ -262,7 +277,8 @@ class RolloutWrapper(object):
                 state=next_state,
                 policy_params=policy_params,
                 cum_reward=new_cum_reward,
-                steps=state_input.steps + 1
+                steps=state_input.steps + 1,
+                valid_mask=new_valid_mask
             )
             state_input = jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), state_input)
 
@@ -272,7 +288,7 @@ class RolloutWrapper(object):
             rng_carry, rng_muzero, rng_net, rng_action, rng_env = jax.random.split(state_input.rng, 5)
 
             logits, value = self.model_forward(state_input.policy_params, state_input.state.observation, rng_net)
-            state_input = jax.tree.map(lambda x : jnp.expand_dims(x, axis=0), state_input)
+            state_input = jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), state_input)
 
             logits = jnp.expand_dims(logits, axis=0)
 
@@ -292,9 +308,8 @@ class RolloutWrapper(object):
             # action = jax.random.categorical(rng_action, jnp.log(policy_output.action_weights), axis=-1)
             state_input, action = jax.tree.map(lambda x: x.squeeze(0), state_input), policy_output.action.squeeze(0)
             next_state = self.env.step(state_input.state, action, rng_env)
-            reward = next_state.rewards[state_input.state.current_player]
-            done = state_input.state.terminated | state_input.state.truncated
-            new_cum_reward = state_input.cum_reward + reward * ~done
+
+            reward, new_cum_reward, new_valid_mask = update_rewards(state_input, next_state)
 
             carry = Carry(
                 rng=rng_carry,
@@ -302,15 +317,24 @@ class RolloutWrapper(object):
                 policy_params=policy_params,
                 cum_reward=new_cum_reward,
                 steps=state_input.steps + 1,
+                valid_mask=new_valid_mask,
             )
 
-            y = [state_input.state, action, next_state]
+            search_stats = SearchStats(
+                num_simulations=jnp.array(policy_output.search_tree.num_simulations),
+                terminated_sum=policy_output.search_tree.embeddings.state.terminated.sum(),
+                rewards_sum=policy_output.search_tree.children_rewards.sum(),
+                value_mean=policy_output.search_tree.children_values.mean(),
+            )
+
+            y = [state_input.state, action, next_state, search_stats]
             return carry, y
 
         def early_termination_loop_with_trajectory(policy_step, max_steps, initial_state):
             def cond_fn(carry):
                 state, _ = carry
                 done = state.state.truncated | state.state.terminated | (state.steps.squeeze() == max_steps)
+                # jax.debug.print("{}", done)
                 return jnp.logical_not(jnp.all(done))
 
             def body_fn(carry):
@@ -342,15 +366,17 @@ class RolloutWrapper(object):
             state=state,
             policy_params=policy_params,
             cum_reward=jnp.zeros(1),
-            steps=jnp.zeros(1, dtype=jnp.int32)
+            steps=jnp.zeros(1, dtype=jnp.int32),
+            valid_mask=jnp.ones(1)
         )
 
         # Run the early termination loop
         final_carry, trajectory = early_termination_loop_with_trajectory(policy_step, args.max_epi_len, state_input)
 
         # Return the sum of rewards accumulated by agent in episode rollout
-        state, action, next_state = trajectory
-        return state, action, next_state, final_carry.cum_reward, final_carry.steps
+        state, action, next_state, search_stats = trajectory
+
+        return state, action, next_state, search_stats, final_carry.cum_reward, final_carry.steps
 
     @property
     def input_shape(self):
@@ -376,19 +402,23 @@ strategy = OpenES(popsize=args.popsize,
 
 es_params = strategy.default_params
 es_params = es_params.replace(sigma_init=args.sigma_init, sigma_decay=args.sigma_decay, sigma_limit=args.sigma_limit)
-es_params = es_params.replace(opt_params=es_params.opt_params.replace(
-    lrate_init=args.lrate_init, lrate_decay=args.lrate_decay, lrate_limit=args.lrate_limit))
+es_params = es_params.replace(
+    opt_params=es_params.opt_params.replace(
+        lrate_init=args.lrate_init,
+        lrate_decay=args.lrate_decay,
+        lrate_limit=args.lrate_limit
+    )
+)
 
 es_state = strategy.initialize(rng, es_params)
 
 fit_shaper = FitnessShaper(maximize=True, centered_rank=True)
 
-
-state, action, next_state, cum_ret, steps =  manager.single_rollout(jax.random.PRNGKey(0), 4, init_policy_params)
-# print(next_state.terminated)
-# print(next_state.reward)
+state, action, next_state, search_stats, cum_ret, steps = \
+    manager.single_rollout(jax.random.PRNGKey(0), 4, init_policy_params)
 
 import wandb
+
 wandb.init(project=f'alphazero-es-pgx-{args.env_name}', config=args.__dict__, settings=wandb.Settings(code_dir="."))
 
 # num_generations = 100
@@ -396,7 +426,6 @@ wandb.init(project=f'alphazero-es-pgx-{args.env_name}', config=args.__dict__, se
 print_every_k_gens = 1
 best_eval = -jnp.inf
 total_frames = 0
-
 
 for gen in range(args.num_generations):
     rng, rng_init, rng_ask, rng_rollout, rng_eval = jax.random.split(rng, 5)
@@ -408,7 +437,7 @@ for gen in range(args.num_generations):
     rng_batch_rollout = jax.random.split(rng_rollout, args.num_mc_evals)
 
     # Perform population evaluation
-    _, _, _, cum_ret, steps = manager.population_rollout(rng_batch_rollout, args.num_simulations, reshaped_params)
+    _, _, _, search_stats, cum_ret, steps = manager.population_rollout(rng_batch_rollout, args.num_simulations, reshaped_params)
 
     # Mean over MC rollouts, shape fitness and update strategy
     fitness = cum_ret.mean(axis=1).squeeze()
@@ -419,13 +448,18 @@ for gen in range(args.num_generations):
     total_frames += steps.sum().item()
 
     log = {'score_hist': fitness, 'score': fitness.mean(), 'max_steps': jnp.max(steps), 'steps_hist': steps,
-           'total_frames': total_frames}
+           'total_frames': total_frames,
+           'search_value_mean': search_stats.value_mean.mean(-1).mean(1),
+           'search_terminated_sum': search_stats.terminated_sum.mean(-1).mean(1),
+           'search_rewards_sum': search_stats.rewards_sum.mean(-1).mean(1)
+           }
     status = f"Generation: {gen + 1} fitness: {fitness.mean():.3f}, max_steps: {jnp.max(steps)}, total frames: {total_frames}"
 
     if (gen + 1) % print_every_k_gens == 0:
 
         eval_params = param_reshaper.reshape(jnp.expand_dims(es_state.mean, axis=0))
         eval_params = jax.tree.map(lambda p: p.squeeze(0), eval_params)
+
 
         def visualize(states, longest_run, max_steps):
             video = []
@@ -434,7 +468,7 @@ for gen in range(args.num_generations):
                 video.append(obs)
             video = jnp.stack(video)
             N, H, W, C = video.shape
-            video = video.sum(-1)/3
+            video = video.sum(-1) / 3
             video = video[..., jnp.newaxis] * 255
             import numpy as np
             video = np.array(video, dtype=np.uint8).clip(0, 255)
@@ -451,10 +485,11 @@ for gen in range(args.num_generations):
 
             log.update({"viz": wandb.Video(video.transpose(0, 3, 1, 2), fps=8, format='gif')})
 
+
         def evaluate(rng_rollout, num_evals, num_simulations):
 
             rng_batch_eval_rollout = jax.random.split(rng_rollout, num_evals)
-            state, action, next_state, cum_ret, steps = \
+            state, action, next_state, search_stats, cum_ret, steps = \
                 manager.batch_rollout(rng_batch_eval_rollout, num_simulations, eval_params)
 
             eval_score = cum_ret.mean()
@@ -463,7 +498,8 @@ for gen in range(args.num_generations):
 
             return eval_score, state, longest_run_index, longest_run_steps
 
-        eval_score, state, longest_run_index, longest_run_steps  = \
+
+        eval_score, state, longest_run_index, longest_run_steps = \
             evaluate(rng_rollout, 20, args.num_simulations)
 
         log.update({
@@ -483,9 +519,8 @@ for gen in range(args.num_generations):
                 visualize(state, longest_run_index, longest_run_steps)
 
             if args.boosted_eval_num_simulations:
-
                 print(f'evaluating {args.boosted_eval_num_simulations} sim inference')
-                eval_score, longest_run_state, longest_run_index, longest_run_steps  = \
+                eval_score, longest_run_state, longest_run_index, longest_run_steps = \
                     evaluate(rng_rollout, 20, args.boosted_eval_num_simulations)
 
                 log.update({

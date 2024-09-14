@@ -34,9 +34,9 @@ parser.add_argument('--num_output_units', type=int, default=3)
 parser.add_argument('--output_activation', type=str, default='categorical')
 parser.add_argument('--env_name', type=str, default='Breakout-MinAtar')
 parser.add_argument('--popsize', type=int, default=600)
-parser.add_argument('--sigma_init', type=float, default=0.01)
+parser.add_argument('--sigma_init', type=float, default=0.001)
 parser.add_argument('--sigma_decay', type=float, default=1.0)
-parser.add_argument('--sigma_limit', type=float, default=0.01)
+parser.add_argument('--sigma_limit', type=float, default=0.001)
 parser.add_argument('--lrate_init', type=float, default=0.0114)
 parser.add_argument('--lrate_decay', type=float, default=1.0)
 parser.add_argument('--lrate_limit', type=float, default=0.001)
@@ -48,7 +48,8 @@ parser.add_argument('--num_simulations', type=int, default=64)
 parser.add_argument('--visualize_off', action='store_true')
 parser.add_argument('--max_epi_len', type=int, default=340)
 parser.add_argument('--opt_name', type=str, choices=evosax.core.GradientOptimizer.keys(), default='adam')
-parser.add_argument('--boosted_eval_num_simulations', type=int, default=None, help='evaluate best scores a second time with this many simulations')
+parser.add_argument('--boosted_eval_num_simulations', type=int, default=None,
+                    help='evaluate best scores a second time with this many simulations')
 args = parser.parse_args()
 
 rng = jax.random.PRNGKey(args.seed)
@@ -175,6 +176,15 @@ from typing import Any, Optional
 import jax
 import jax.numpy as jnp
 import gymnax
+import chex
+
+
+@chex.dataclass
+class SearchStats:
+    num_simulations: chex.Array
+    value_mean: chex.Array
+    rewards_sum: chex.Array
+    terminated_sum: chex.Array
 
 
 class RolloutWrapper(object):
@@ -291,6 +301,13 @@ class RolloutWrapper(object):
                 gumbel_scale=1.0,
             )
 
+            search_stats = SearchStats(
+                num_simulations=jnp.array(policy_output.search_tree.num_simulations),
+                terminated_sum=policy_output.search_tree.embeddings[7].sum(),
+                rewards_sum=policy_output.search_tree.children_rewards.sum(),
+                value_mean=policy_output.search_tree.children_values.mean(),
+            )
+
             # action = jax.random.categorical(rng_action, jnp.log(policy_output.action_weights), axis=-1)
             action = policy_output.action.squeeze(0)
             # keys = jax.random.split(key2, batch_size)
@@ -313,7 +330,7 @@ class RolloutWrapper(object):
                 done,
             ]
             carry = jax.tree.map(lambda s: jnp.expand_dims(s, axis=0), carry)
-            y = [obs, state, action, reward, next_obs, done]
+            y = [obs, state, action, reward, next_obs, done, search_stats]
             return carry, y
 
         def early_termination_loop_with_trajectory(policy_step, max_steps, initial_state):
@@ -362,9 +379,9 @@ class RolloutWrapper(object):
         carry_out, scan_out = early_termination_loop_with_trajectory(policy_step, args.max_epi_len, state_input)
 
         # Return the sum of rewards accumulated by agent in episode rollout
-        obs, state, action, reward, next_obs, done = scan_out
+        obs, state, action, reward, next_obs, done, search_stats = scan_out
         cum_return, steps = carry_out[-4], carry_out[-2]
-        return obs, state, action, reward, next_obs, done, cum_return, steps
+        return obs, state, action, reward, next_obs, done, search_stats, cum_return, steps
 
     @property
     def input_shape(self):
@@ -398,7 +415,10 @@ fit_shaper = FitnessShaper(maximize=True, centered_rank=True)
 
 import wandb
 
-wandb.init(project=f'alphazero-es-{args.env_name}', config=args.__dict__, settings=wandb.Settings(code_dir="."))
+wandb.init(project=f'alphazero-es-pgx-{args.env_name}',
+           config=args.__dict__,
+           settings=wandb.Settings(code_dir="."),
+           tags=['gymnax'])
 
 # num_generations = 100
 # num_mc_evals = 128
@@ -416,8 +436,8 @@ for gen in range(args.num_generations):
     rng_batch_rollout = jax.random.split(rng_rollout, args.num_mc_evals)
 
     # Perform population evaluation
-    _, _, _, _, _, _, cum_ret, steps = manager.population_rollout(rng_batch_rollout, args.num_simulations,
-                                                                  reshaped_params)
+    _, _, _, _, _, _, search_stats, cum_ret, steps = manager.population_rollout(rng_batch_rollout, args.num_simulations,
+                                                                                reshaped_params)
 
     # Mean over MC rollouts, shape fitness and update strategy
     fitness = cum_ret.mean(axis=1).squeeze()
@@ -428,13 +448,18 @@ for gen in range(args.num_generations):
     total_frames += steps.sum().item()
 
     log = {'score_hist': fitness, 'score': fitness.mean(), 'max_steps': jnp.max(steps), 'steps_hist': steps,
-           'total_frames': total_frames}
+           'total_frames': total_frames,
+           'search_value_mean': search_stats.value_mean.mean(-1).mean(1),
+           'search_terminated_sum': search_stats.terminated_sum.mean(-1).mean(1),
+           'search_rewards_sum': search_stats.rewards_sum.mean(-1).mean(1)
+           }
     status = f"Generation: {gen + 1} fitness: {fitness.mean():.3f}, max_steps: {jnp.max(steps)}, total frames: {total_frames}"
 
     if (gen + 1) % print_every_k_gens == 0:
 
         eval_params = param_reshaper.reshape(jnp.expand_dims(es_state.mean, axis=0))
         eval_params = jax.tree.map(lambda p: p.squeeze(0), eval_params)
+
 
         def visualize(state, longest_run, max_steps):
             # visualization
@@ -448,10 +473,11 @@ for gen in range(args.num_generations):
             vis.animate(anim_path)
             log.update({"viz": wandb.Video(anim_path, fps=8, format='gif')})
 
+
         def evaluate(rng_rollout, num_evals, num_simulations):
 
             rng_batch_eval_rollout = jax.random.split(rng_rollout, num_evals)
-            obs, state, action, reward, next_obs, done, cum_ret, steps = \
+            obs, state, action, reward, next_obs, done, search_stats, cum_ret, steps = \
                 manager.batch_rollout(rng_batch_eval_rollout, num_simulations, eval_params)
 
             eval_score = cum_ret.mean()
@@ -460,7 +486,8 @@ for gen in range(args.num_generations):
 
             return eval_score, state, longest_run_index, longest_run_steps
 
-        eval_score, state, longest_run_index, longest_run_steps  = \
+
+        eval_score, state, longest_run_index, longest_run_steps = \
             evaluate(rng_rollout, 20, args.num_simulations)
 
         log.update({
@@ -480,9 +507,8 @@ for gen in range(args.num_generations):
                 visualize(state, longest_run_index, longest_run_steps)
 
             if args.boosted_eval_num_simulations:
-
                 print(f'evaluating {args.boosted_eval_num_simulations} sim inference')
-                eval_score, longest_run_state, longest_run_index, longest_run_steps  = \
+                eval_score, longest_run_state, longest_run_index, longest_run_steps = \
                     evaluate(rng_rollout, 20, args.boosted_eval_num_simulations)
 
                 log.update({
