@@ -6,3 +6,4 @@
 /.idea/vcs.xml
 /.idea/workspace.xml
 /wandb/
+/eval/opening_book.pkl
