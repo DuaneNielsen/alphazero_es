@@ -1,11 +1,9 @@
 import copy
-import numpy as np
 import pickle
 import argparse
 from random import shuffle, seed
-from tqdm import trange
 from collections import defaultdict
-import json
+
 
 X = 1
 O = 0
@@ -254,7 +252,9 @@ def make_book():
         remmaped_action_book[k] = c * 3 + r
 
     with open('tictactoe_book.py', 'w') as f:
-        json.dump(remmaped_action_book, f)
+        python_code = f'action_book = {remmaped_action_book}'
+        f.write(python_code)
+
 
 
 # with open('tictactoe_book.py', 'r') as f:
