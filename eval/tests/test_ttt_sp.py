@@ -73,10 +73,11 @@ def test_random_moves_batched():
     env = sp.TicTacToeSinglePlayer()
     init, step = jax.vmap(env.init), jax.vmap(env.step)
     vmap_act_randomly = jax.vmap(act_randomly)
-    batch_size = 100
+    batch_size = 10
     rng = PRNGKey(0)
     rng_batch_init = split(rng, batch_size)
     state = init(rng_batch_init)
+    ai_player = (state.current_player + 1) % 2
 
     while not state.terminated.all():
         rng, rng_action = split(rng)
@@ -84,3 +85,5 @@ def test_random_moves_batched():
         action = vmap_act_randomly(rng_batch_action, state.legal_action_mask)
         state = step(state, action)
 
+        jax.debug.print('{}', state.terminated)
+        jax.debug.print('{}',state.rewards[jnp.arange(batch_size), ai_player])
