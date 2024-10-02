@@ -3,22 +3,32 @@ from pgx import core
 from jax import Array
 import jax.numpy as jnp
 from pgx.tic_tac_toe import _win_check
-from tictactoe_book import action_book
+from eval.tictactoe_book import action_book
+import jax
 
 action_book = jnp.array(action_book)
 base3_hash = jnp.array([3 ** i for i in range(10)])
 
 
 def hash_state(state: core.State):
-    player = state.current_player[jnp.newaxis] + 1  # pgx has the wierd player convention
+    player = state._turn[jnp.newaxis]
     board = state._board + 1  # the board uses -1 based indexing
     hashable = jnp.concatenate([board, player])
     hashable *= base3_hash
     hashcode = hashable.sum(-1)
     return hashcode
 
+def print_state(step, state):
+    jax.debug.print(
+        step + (" state._board {} "
+        "state.current_player: {} "
+        "state.rewards: {} "
+        "state.terminated {}"),
+        state._board, state.current_player, state.rewards, state.terminated
+    )
 
 def _step(state: core.State, action: Array) -> core.State:
+
     state = state.replace(_board=state._board.at[action].set(state._turn))  # type: ignore
     won = _win_check(state._board, state._turn)
     reward = jax.lax.cond(
@@ -35,16 +45,14 @@ def _step(state: core.State, action: Array) -> core.State:
         _turn=(state._turn + 1) % 2,
     )
 
-    # jax.debug.print('player {} {} player_won {}', action, state._board, won)
     hash_board = hash_state(state)
     ai_action = action_book[hash_board]
-    jax.debug.print('ai {} {} {} {}', state.current_player, state._board, hash_board, ai_action, )
     ai_action = jnp.where(~won, ai_action, 0)
     ai_state = state.replace(_board=state._board.at[ai_action].set(state._turn))
-    ai_won = _win_check(state._board, state._turn)
+    ai_won = _win_check(ai_state._board, ai_state._turn)
     ai_reward = jax.lax.cond(
         ai_won,
-        lambda: jnp.float32([-1, -1]).at[state.current_player].set(1),
+        lambda: jnp.float32([-1, -1]).at[ai_state.current_player].set(1),
         lambda: jnp.zeros(2, jnp.float32),
     )
     ai_state = ai_state.replace(
@@ -54,11 +62,12 @@ def _step(state: core.State, action: Array) -> core.State:
         terminated=ai_won | jnp.all(ai_state._board != -1),
         _turn=(ai_state._turn + 1) % 2,
     )
+    player_move_is_final = won | state.terminated
     state = jax.tree.map(
-        lambda state, ai_state : jnp.where(won, state, ai_state), state,ai_state
+        lambda state, ai_state : jnp.where(player_move_is_final, state, ai_state), state,ai_state
     )
-    # jax.debug.print('ai {} {} ai_won {}', ai_action, state._board, ai_won)
     return state
+
 
 class TicTacToeSinglePlayer(pgx.tic_tac_toe.TicTacToe):
 
