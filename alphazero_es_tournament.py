@@ -15,6 +15,7 @@ import eval.opening_book as opening_book
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 import pickle
+import pgx
 
 import os
 
@@ -32,9 +33,10 @@ parser.add_argument('--aznet_blocks', type=int, default=5)
 parser.add_argument('--aznet_layernorm', type=str, default='None')
 # parser.add_argument('--num_hidden_units', type=int, default=16)
 # parser.add_argument('--num_linear_layers', type=int, default=1)
-parser.add_argument('--num_output_units', type=int, default=1225)
+# parser.add_argument('--num_output_units', type=int, default=1225) # garner chess
+parser.add_argument('--num_output_units', type=int, default=9)  # tic_tac_toe
 parser.add_argument('--output_activation', type=str, default='categorical')
-parser.add_argument('--env_name', type=str, default='gardner_chess')
+parser.add_argument('--env_name', type=str, default='tic_tac_toe')
 parser.add_argument('--popsize', type=int, default=900)
 parser.add_argument('--sigma_init', type=float, default=0.001)
 parser.add_argument('--sigma_decay', type=float, default=1.0)
@@ -46,7 +48,7 @@ parser.add_argument('--num_generations', type=int, default=512)
 parser.add_argument('--num_mc_evals', type=int, default=1)
 parser.add_argument('--network', type=str, default='AZnet')  # so it appears as a hyperparameter in wandb
 parser.add_argument('--seed', type=int, default=0)
-parser.add_argument('--num_simulations', type=int, default=64)
+parser.add_argument('--num_simulations', type=int, default=4)
 parser.add_argument('--visualize_off', action='store_true')
 parser.add_argument('--max_epi_len', type=int, default=340)
 parser.add_argument('--opt_name', type=str, choices=evosax.core.GradientOptimizer.keys(), default='adam')
@@ -56,7 +58,6 @@ args = parser.parse_args()
 
 assert args.popsize % 2 == 0, "popsize must be an even number for tournaments"
 rng = jax.random.PRNGKey(args.seed)
-
 
 class ResnetV2Block(nn.Module):
     features: int
@@ -209,29 +210,21 @@ class RolloutWrapper(object):
     def __init__(
             self,
             model_forward,
-            env_name: str,
+            env: pgx.Env,
             num_env_steps: int = 1000,
-            baseline_model = None,
-            stochastic_actions = False
+            discount: float = -1.0,
+            stochastic_actions=False,
+            single_player=False
     ):
         """Wrapper to define batch evaluation for generation parameters."""
-        self.env_name = env_name
-        self.env = pgx.make(env_name)
+        self.env = env
         self.model_forward = model_forward
         self.num_env_steps = num_env_steps
+        self.discount = discount
         self.stochastic_actions = stochastic_actions
-
-        def flat_baseline_model(model_params, observation, rng_net):
-            observation = jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), observation)
-            policy, value = baseline_model(observation)
-            return policy.squeeze(0), value
-
-        def flat_dummy_model(model_params, observation, rng_net):
-            return jnp.ones(args.num_output_units), jnp.ones(1)
-
-        self.baseline_model = flat_baseline_model if baseline_model is not None else flat_dummy_model
-        self.baseline_model_turn = False
-
+        self.single_player = single_player
+        if single_player:
+            assert discount > 0., "Negative discount for single player mode is a bad idea"
 
     @functools.partial(jax.jit, static_argnums=(0, 2,))
     def population_rollout(self, rng_eval, num_simulations, policy_params):
@@ -261,9 +254,8 @@ class RolloutWrapper(object):
             new_valid_mask = state_input.valid_mask * (1 - done)
             return reward, new_cum_reward, new_valid_mask
 
-        @functools.partial(jax.jit, static_argnums=(0,))
-        def recurrent_fn(baseline, model_params, rng_key: jnp.ndarray, action: jnp.ndarray, state_input):
-
+        @functools.partial(jax.jit)
+        def recurrent_fn(model_params, rng_key: jnp.ndarray, action: jnp.ndarray, state_input):
             rng_key, rng_step, rng_net, rng_env = jax.random.split(rng_key, 4)
 
             state_input, action = jax.tree.map(lambda x: x.squeeze(0), state_input), action.squeeze(0)
@@ -271,15 +263,14 @@ class RolloutWrapper(object):
 
             reward, new_cum_reward, new_valid_mask = update_rewards(state_input, next_state)
 
-            logits, value = lax.cond(baseline, self.baseline_model, self.model_forward, model_params, next_state.observation, rng_net)
+            logits, value = self.model_forward(model_params, next_state.observation, rng_net)
 
             # mask invalid actions
             logits = logits - jnp.max(logits, axis=-1, keepdims=True)
             logits = jnp.where(next_state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
             value = jnp.where(next_state.terminated, 0.0, value.squeeze(0))
 
-            discount = -1.0 * jnp.ones_like(value)
-            # discount = 0.99 * jnp.ones_like(value)
+            discount = self.discount * jnp.ones_like(value)
             discount = jnp.where(next_state.terminated, 0.0, discount)
 
             recurrent_fn_output = mctx.RecurrentFnOutput(
@@ -302,31 +293,22 @@ class RolloutWrapper(object):
 
             return recurrent_fn_output, state_input
 
-        @functools.partial
-        def baseline_recurrent_fn(model_params, rng_key: jnp.ndarray, action: jnp.ndarray, state_input):
-            return recurrent_fn(True, model_params, rng_key, action, state_input)
-
-        @functools.partial
-        def model_recurrent_fn(model_params, rng_key: jnp.ndarray, action: jnp.ndarray, state_input):
-            return recurrent_fn(False, model_params, rng_key, action, state_input)
-
         def policy_step(state_input, _):
             rng_carry, rng_muzero, rng_net, rng_action, rng_env = jax.random.split(state_input.rng, 5)
-            current_player_policy_params = jax.tree.map(lambda x: x[state_input.state.current_player],
-                                                        state_input.policy_params)
-            # logits, value = self.model_forward(current_player_policy_params, state_input.state.observation, rng_net)
 
-            logits, value = lax.cond(self.baseline_model_turn, self.baseline_model, self.model_forward, current_player_policy_params, state_input.state.observation, rng_net)
-            if self.baseline_model is not None:
-                self.baseline_model_turn = not self.baseline_model_turn
+            if self.single_player:
+                current_player_policy_params = policy_params
+            else:
+                current_player_policy_params = jax.tree.map(lambda x: x[state_input.state.current_player],
+                                                            state_input.policy_params)
+
+            logits, value = self.model_forward(current_player_policy_params, state_input.state.observation, rng_net)
 
             state_input = jax.tree.map(lambda x: jnp.expand_dims(x, axis=0), state_input)
 
             logits = jnp.expand_dims(logits, axis=0)
 
             root = mctx.RootFnOutput(prior_logits=logits, value=value, embedding=state_input)
-
-            recurrent_fn = baseline_recurrent_fn if self.baseline_model_turn else model_recurrent_fn
 
             policy_output = mctx.gumbel_muzero_policy(
                 params=current_player_policy_params,
@@ -347,10 +329,7 @@ class RolloutWrapper(object):
             state_input = jax.tree.map(lambda x: x.squeeze(0), state_input)
             next_state = self.env.step(state_input.state, action, rng_env)
 
-            reward = next_state.rewards
-            done = state_input.state.terminated | state_input.state.truncated
-            new_cum_reward = state_input.cum_reward + reward * state_input.valid_mask
-            new_valid_mask = state_input.valid_mask * (1 - done)
+            reward, new_cum_reward, new_valid_mask = update_rewards(state_input, next_state)
 
             carry = Carry(
                 rng=rng_carry,
@@ -391,6 +370,7 @@ class RolloutWrapper(object):
 
                 return (next_state, updated_trajectory)
 
+            # allocate memory to store the trajectory
             trajectory_template = policy_step(initial_state, ())[1]
             initial_trajectory = jax.tree_util.tree_map(
                 lambda x: jnp.zeros((max_steps,) + x.shape, dtype=x.dtype),
@@ -402,17 +382,19 @@ class RolloutWrapper(object):
 
             return final_state, final_trajectory
 
-        state_input = Carry(
+        cum_reward = jnp.zeros(1) if self.single_player else jnp.zeros(2)
+
+        initial_state = Carry(
             rng=rng_episode,
             state=state,
             policy_params=policy_params,
-            cum_reward=jnp.zeros(2),
+            cum_reward=cum_reward,
             steps=jnp.zeros(1, dtype=jnp.int32),
             valid_mask=jnp.ones(1)
         )
 
         # Run the early termination loop
-        final_carry, trajectory = early_termination_loop_with_trajectory(policy_step, args.max_epi_len, state_input)
+        final_carry, trajectory = early_termination_loop_with_trajectory(policy_step, self.num_env_steps, initial_state)
 
         # Return the sum of rewards accumulated by agent in episode rollout
         state, action, next_state, search_stats = trajectory
@@ -428,11 +410,14 @@ class RolloutWrapper(object):
 
 
 print('starting')
-# Define rollout manager for env
-manager = RolloutWrapper(model.apply, env_name=args.env_name, num_env_steps=args.max_epi_len)
-baseline_model = pgx.make_baseline_model(f'{args.env_name}_v0')
 
-# from evosax import OpenES
+# Define rollout manager for env
+env = pgx.make(args.env_name)
+manager = RolloutWrapper(model.apply, env=env, num_env_steps=args.max_epi_len)
+
+from eval.tic_tac_toe_single_player import TicTacToeSinglePlayer
+eval_env = TicTacToeSinglePlayer()
+eval_manager = RolloutWrapper(model.apply, env=eval_env, num_env_steps=args.max_epi_len, single_player=True, discount=1.)
 
 # Helper for parameter reshaping into appropriate datastructures
 param_reshaper = ParameterReshaper(init_policy_params, n_devices=1)
@@ -457,9 +442,15 @@ es_state = strategy.initialize(rng, es_params)
 fit_shaper = FitnessShaper(maximize=True, centered_rank=True)
 
 
+# verify that single rollout works
 test_params = jax.tree.map(lambda x: jnp.stack([x, x], axis=0), init_policy_params)
 state, action, next_state, search_stats, cum_ret, steps = \
     manager.single_rollout(jax.random.PRNGKey(0), 4, test_params)
+
+# verify eval rollout works
+state, action, next_state, search_stats, cum_ret, steps = \
+    eval_manager.single_rollout(jax.random.PRNGKey(0), 4, init_policy_params)
+
 
 import wandb
 
@@ -505,12 +496,9 @@ for gen in range(args.num_generations):
 
     if (gen + 1) % print_every_k_gens == 0:
 
-        eval_manager = RolloutWrapper(model.apply, env_name=args.env_name, num_env_steps=args.max_epi_len,
-                                      baseline_model=baseline_model, stochastic_actions=True)
-
         eval_params = param_reshaper.reshape(jnp.expand_dims(es_state.mean, axis=0))
-        eval_params = jax.tree.map(lambda x: jnp.concatenate([x, x], axis=0), eval_params)
-        # eval_params = jax.tree.map(lambda p: p.squeeze(0), eval_params)
+        # eval_params = jax.tree.map(lambda x: jnp.concatenate([x, x], axis=0), eval_params)
+        eval_params = jax.tree.map(lambda p: p.squeeze(0), eval_params)
 
         def visualize(states, longest_run, max_steps):
             video = []
@@ -524,16 +512,6 @@ for gen in range(args.num_generations):
             import numpy as np
             video = np.array(video, dtype=np.uint8).clip(0, 255)
             video = np.repeat(video, 3, axis=-1)
-
-            # x = nn.Conv(
-            #     features=C,
-            #     kernel_size=(1, 1),
-            #     padding=0,
-            #     kernel_init=,
-            #     use_bias=False,
-            #     dtype=self.dtype
-            # )(x)
-
             log.update({"viz": wandb.Video(video.transpose(0, 3, 1, 2), fps=8, format='gif')})
 
 
@@ -542,6 +520,8 @@ for gen in range(args.num_generations):
             rng_batch_eval_rollout = jax.random.split(rng_rollout, num_evals)
             state, action, next_state, search_stats, cum_ret, steps = \
                 eval_manager.batch_rollout(rng_batch_eval_rollout, num_simulations, eval_params)
+
+            jax.debug.print('reward {}', cum_ret.T)
 
             eval_score = cum_ret.mean(0)[0]
             longest_run_steps = jnp.max(steps)
@@ -559,7 +539,7 @@ for gen in range(args.num_generations):
         })
         status += f' Eval fitness: {eval_score:.3f}, max_steps: {longest_run_steps}'
 
-        # save if the model is better, update the visualization, and try a 1000 step run
+        # save if the model is better, update the visualization, and try a 1000 simulation mcts
         if eval_score.item() > best_eval:
             best_eval = max(best_eval, eval_score.item())
             with open(f'{wandb.run.dir}/best_{best_eval:.2f}.param', 'wb') as f:

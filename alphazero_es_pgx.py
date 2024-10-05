@@ -386,6 +386,64 @@ class RolloutWrapper(object):
         return state.observation.shape
 
 
+class SinglePlayerRollout(RolloutWrapper):
+    def __init__(self,
+                 model_forward,
+                 env_name: str,
+                 num_env_steps: int = 1000,
+                 ):
+        super().__init__(model_forward, env_name, num_env_steps)
+
+    @functools.partial(jax.jit, static_argnums=(0, 2,))
+    def single_rollout(self, rng_input, num_simulations, policy_params):
+        """Rollout a pendulum episode with lax.scan."""
+        # Reset the environment
+        rng_reset, rng_episode = jax.random.split(rng_input)
+        obs, state = self.env.reset(rng_reset, self.env_params)
+
+        def recurrent_fn(model_params, rng_key: jnp.ndarray, action: jnp.ndarray, state_input):
+            # model: params
+            # state: embedding
+
+            rng_key, rng_step, rng_net = jax.random.split(rng_key, 3)
+            obs, state, policy_params, rng, cum_reward, valid_mask, step, done = (
+                jax.tree.map(lambda s: jnp.squeeze(s, axis=0), state_input))
+            # model_params, model_state = model
+            # current_player = obs.current_player
+
+            # step the environment
+            next_obs, next_state, reward, done, _ = self.env.step(
+                rng_step, state, action.squeeze(0), self.env_params
+            )
+
+            # store the transition and reward
+            new_cum_reward = cum_reward + reward * valid_mask
+            new_valid_mask = valid_mask * (1 - done)
+            state_input = [next_obs, next_state, policy_params, rng_key, new_cum_reward, new_valid_mask, step + 1, done]
+            state_input = jax.tree.map(lambda s: jnp.expand_dims(s, axis=0), state_input)
+
+            # compute the logits and values for the next state
+            logits, value = self.model_forward(model_params, next_obs, rng_net)
+
+            # mask invalid actions
+            logits = logits - jnp.max(logits, axis=-1, keepdims=True)
+            # logits = jnp.where(state.legal_action_mask, logits, jnp.finfo(logits.dtype).min)
+
+            # reward = state.rewards  # [jnp.arange(state.rewards.shape[0]), current_player]
+            value = jnp.where(done, 0.0, value)
+            # discount = -1.0 * jnp.ones_like(value)
+            discount = 0.99 * jnp.ones_like(value)
+            discount = jnp.where(done, 0.0, discount)
+
+            recurrent_fn_output = mctx.RecurrentFnOutput(
+                reward=jnp.expand_dims(reward, axis=0),
+                discount=discount,
+                prior_logits=jnp.expand_dims(logits, axis=0),
+                value=value,
+            )
+            return recurrent_fn_output, state_input
+
+
 print('starting')
 # Define rollout manager for env
 manager = RolloutWrapper(model.apply, env_name=args.env_name, num_env_steps=args.max_epi_len)
@@ -437,7 +495,8 @@ for gen in range(args.num_generations):
     rng_batch_rollout = jax.random.split(rng_rollout, args.num_mc_evals)
 
     # Perform population evaluation
-    _, _, _, search_stats, cum_ret, steps = manager.population_rollout(rng_batch_rollout, args.num_simulations, reshaped_params)
+    _, _, _, search_stats, cum_ret, steps = manager.population_rollout(rng_batch_rollout, args.num_simulations,
+                                                                       reshaped_params)
 
     # Mean over MC rollouts, shape fitness and update strategy
     fitness = cum_ret.mean(axis=1).squeeze()
@@ -475,7 +534,7 @@ for gen in range(args.num_generations):
             video = np.repeat(video, 3, axis=-1)
 
             # x = nn.Conv(
-            #     features=C,
+            #     features=C,11
             #     kernel_size=(1, 1),
             #     padding=0,
             #     kernel_init=,
